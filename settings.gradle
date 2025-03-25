@@ -1,0 +1,4 @@
+rootProject.name = 'parallel-lbs'
+include 'lab1'
+include 'lab2'
+
