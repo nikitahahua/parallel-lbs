@@ -24,13 +24,16 @@ public class ThreadPool {
     private final Condition pausedCondition = pauseLock.newCondition();
     private final ReentrantLock bufferLock = new ReentrantLock();
     private final Condition bufferCondition = bufferLock.newCondition();
+    private final ReentrantLock processLock = new ReentrantLock();
+    private final Condition processingCondition = processLock.newCondition();
+
     private final Thread bufferThread;
 
     private final Object printLock = new Object();
 
     private List<Integer> totalWaitingTasks = new ArrayList<>();
     private List<Integer> totalQueueSizes = new ArrayList<>();
-    private Pair<Integer, Long> totalWaitTime =  Pair.of(0, 0L);
+    private Pair<Integer, Long> totalWaitTime = Pair.of(0, 0L);
 
     public ThreadPool() {
         for (int i = 0; i < WORKERS_AMOUNT; i++) {
@@ -140,11 +143,16 @@ public class ThreadPool {
                 try {
                     totalQueueSizes.add(taskQueue.size());
                     isBuffering = false;
+                    processLock.lock();
+                    processingCondition.signalAll();
+                    processLock.unlock();
                     System.out.println(Thread.currentThread() + " STOP Buffering for " + BUFFER_INTERVAL + " seconds\n");
                     bufferCondition.signalAll();
                 } finally {
                     bufferLock.unlock();
                 }
+
+
 
                 Thread.sleep(BUFFER_INTERVAL);
             } catch (InterruptedException e) {
@@ -176,31 +184,44 @@ public class ThreadPool {
                     pauseLock.unlock();
                 }
 
+                Task task = null;
+                int size = 0;
+
                 bufferLock.lock();
                 try {
                     while (isBuffering) {
-                        bufferCondition.await();
+                        try {
+                            bufferCondition.await();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            System.out.println(Thread.currentThread().getName() + " worker interrupted");
+                            return;
+                        }
                     }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    System.out.println(Thread.currentThread().getName() + " worker interrupted");
-                    return;
                 } finally {
                     bufferLock.unlock();
                 }
 
-                Task task = null;
-                synchronized (printLock) {
-                    task = taskQueue.take();
-                    if (task == null) {
-                        continue;
+                processLock.lock();
+                task = taskQueue.take();
+                size = taskQueue.size();
+                System.out.println(Thread.currentThread().getName() + " trying to get task " + task);
+                if (task == null) {
+                    try {
+                        System.out.println(Thread.currentThread().getName() + " waiting for new task as queue is empty ");
+                        processingCondition.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        System.out.println(Thread.currentThread().getName() + " worker interrupted");
+                        return;
                     }
-                    int size = taskQueue.size();
+                }
+                processLock.unlock();
+
+                if (task != null) {
                     synchronized (printLock) {
                         System.out.println(Thread.currentThread().getName() + " processing task " + task + " queue size " + size);
                     }
-                }
-                if (task != null) {
                     task.execute();
                     totalWaitingTasks.add(task.getSleepTime());
                 }
@@ -215,7 +236,16 @@ public class ThreadPool {
         @Override
         public void run() {
             while (isRunning()) {
-                submit(new Task());
+                try {
+                    processLock.lock();
+                    submit(new Task());
+                    if (!taskQueue.isEmpty() && !isBuffering) {
+                        processingCondition.signal();
+                    }
+                } finally {
+                    processLock.unlock();
+                }
+
                 try {
                     Thread.sleep(MIN_SLEEP + (int) (Math.random() * (MAX_SLEEP - MIN_SLEEP)));
                 } catch (InterruptedException e) {
